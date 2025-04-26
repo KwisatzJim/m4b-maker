@@ -5,6 +5,13 @@ a Rust app to take mp3's and make an Audiobook in .m4b format.
 
 install rust
 
+(official method from rust-lang.org)
+```
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Clone this repository and run the app:
+
 ```
 git clone https://github.com/KwisatzJim/m4b-maker
 ```
