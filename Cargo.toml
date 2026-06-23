@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-eframe = "0.26"
-rfd = "0.12"           # File dialogs
-rodio = "0.17"         # Audio playback
-tempfile = "3.8"       # Temporary files
-which = "6.0"          # Check for ffmpeg
+eframe = "0.27.2"
+rfd = "0.17.2"           # File dialogs
+rodio = "0.22.2"         # Audio playback
+tempfile = "3.27.0"       # Temporary files
+which = "8.0.4"          # Check for ffmpeg

@@ -1,4 +1,4 @@
-use eframe::{egui, App, Frame};
+use eframe::{App, Frame, egui};
 use rfd::FileDialog;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -95,7 +95,7 @@ impl M4bApp {
                 "128k".to_string(),
                 "-movflags".to_string(),
                 "+faststart".to_string(),
-                "-progress".to_string(), 
+                "-progress".to_string(),
                 "-".to_string(), // output progress to stdout
             ];
 
@@ -134,26 +134,22 @@ impl M4bApp {
 
             // Handle stderr in a separate thread
             thread::spawn(move || {
-                for line in stderr.lines() {
-                    if let Ok(line) = line {
-                        if let Ok(mut log) = output_log.lock() {
-                            log.push_str(&line);
-                            log.push('\n');
-                        }
-                        repaint_ctx.request_repaint();
+                for line in stderr.lines().flatten() {
+                    if let Ok(mut log) = output_log.lock() {
+                        log.push_str(&line);
+                        log.push('\n');
                     }
+                    repaint_ctx.request_repaint();
                 }
             });
 
             // Read stdout here (usually nothing from ffmpeg, but included just in case)
-            for line in stdout.lines() {
-                if let Ok(line) = line {
-                    if let Ok(mut log) = ffmpeg_output_clone.lock() {
-                        log.push_str(&line);
-                        log.push('\n');
-                    }
-                    ctx_clone.request_repaint();
+            for line in stdout.lines().flatten() {
+                if let Ok(mut log) = ffmpeg_output_clone.lock() {
+                    log.push_str(&line);
+                    log.push('\n');
                 }
+                ctx_clone.request_repaint();
             }
 
             let exit_code = match child.wait() {
@@ -195,22 +191,19 @@ impl App for M4bApp {
                     self.dark_mode = !self.dark_mode;
                 }
 
-                if ui.button("📁 Select Files").clicked() {
-                    if let Some(files) = FileDialog::new()
+                if ui.button("📁 Select Files").clicked()
+                    && let Some(files) = FileDialog::new()
                         .add_filter("Audio", &["mp3", "m4a", "wav"])
                         .pick_files()
-                    {
-                        self.files = files.iter().map(|p| p.display().to_string()).collect();
-                    }
+                {
+                    self.files = files.iter().map(|p| p.display().to_string()).collect();
                 }
 
-                if ui.button("💾 Export to .m4b").clicked() {
-                    if let Some(output) = FileDialog::new()
-                        .set_file_name("audiobook.m4b")
-                        .save_file()
-                    {
-                        self.generate_m4b(&output.display().to_string(), ctx);
-                    }
+                if ui.button("💾 Export to .m4b").clicked()
+                    && let Some(output) =
+                        FileDialog::new().set_file_name("audiobook.m4b").save_file()
+                {
+                    self.generate_m4b(&output.display().to_string(), ctx);
                 }
             });
 
@@ -243,5 +236,9 @@ impl App for M4bApp {
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions::default();
-    eframe::run_native("M4B Maker", options, Box::new(|_cc| Box::new(M4bApp::default())))
+    eframe::run_native(
+        "M4B Maker",
+        options,
+        Box::new(|_cc| Box::new(M4bApp::default())),
+    )
 }
