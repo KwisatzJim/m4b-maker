@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-eframe = "0.27.2"
+eframe = "0.32.3"
 rfd = "0.17.2"           # File dialogs
 rodio = "0.22.2"         # Audio playback
 tempfile = "3.27.0"       # Temporary files

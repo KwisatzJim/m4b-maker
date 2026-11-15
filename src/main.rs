@@ -1,8 +1,8 @@
 use eframe::{App, Frame, egui};
 use rfd::FileDialog;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -12,6 +12,7 @@ pub struct M4bApp {
     pub title: String,
     pub author: String,
     pub ffmpeg_output: Arc<Mutex<String>>,
+    export_running: Arc<AtomicBool>,
 }
 
 impl Default for M4bApp {
@@ -22,12 +23,17 @@ impl Default for M4bApp {
             title: String::new(),
             author: String::new(),
             ffmpeg_output: Arc::new(Mutex::new(String::new())),
+            export_running: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
 impl M4bApp {
     fn generate_m4b(&mut self, output_path: &str, ctx: &egui::Context) {
+        if self.export_running.load(Ordering::SeqCst) {
+            return;
+        }
+
         // Clear previous output
         if let Ok(mut log) = self.ffmpeg_output.lock() {
             *log = "🔄 Generating m4b...\n".to_string();
@@ -54,31 +60,29 @@ impl M4bApp {
 
         let mut input_list = String::from("🔍 FFmpeg input list:\n");
         for file in &self.files {
-            if let Err(e) = writeln!(tmp_file, "file '{}'", file) {
+            // FFmpeg requires closing the quote, escaping the apostrophe,
+            // then reopening the quote around the rest of the path.
+            let escaped_file = file.replace('\'', "'\\''");
+            if let Err(e) = writeln!(tmp_file, "file '{}'", escaped_file) {
                 if let Ok(mut log) = self.ffmpeg_output.lock() {
                     *log = format!("❌ Failed to write to temp file: {e}");
                 }
                 return;
             }
-            input_list += &format!("file '{}'\n", file);
+            input_list += &format!("file '{}'\n", escaped_file);
         }
 
-        // Persist file and path
-        let concat_path: PathBuf = match tmp_file.keep() {
-            Ok((_, path)) => path,
-            Err(e) => {
-                if let Ok(mut log) = self.ffmpeg_output.lock() {
-                    *log = format!("❌ Failed to keep temp file: {e}");
-                }
-                return;
-            }
-        };
+        // Close the file and move its cleanup owner into the export worker.
+        // The list stays available to FFmpeg and is deleted when the worker exits.
+        let concat_path = tmp_file.into_temp_path();
 
         let ffmpeg_output_clone = Arc::clone(&self.ffmpeg_output);
         let ctx_clone = ctx.clone();
         let title = self.title.clone();
         let author = self.author.clone();
         let output_path = output_path.to_string();
+        let export_running = Arc::clone(&self.export_running);
+        export_running.store(true, Ordering::SeqCst);
 
         thread::spawn(move || {
             let mut args = vec![
@@ -122,6 +126,8 @@ impl M4bApp {
                     if let Ok(mut log) = ffmpeg_output_clone.lock() {
                         *log = format!("❌ Failed to launch ffmpeg: {e}");
                     }
+                    export_running.store(false, Ordering::SeqCst);
+                    ctx_clone.request_repaint();
                     return;
                 }
             };
@@ -133,7 +139,7 @@ impl M4bApp {
             let repaint_ctx = ctx_clone.clone();
 
             // Handle stderr in a separate thread
-            thread::spawn(move || {
+            let stderr_thread = thread::spawn(move || {
                 for line in stderr.lines().flatten() {
                     if let Ok(mut log) = output_log.lock() {
                         log.push_str(&line);
@@ -156,6 +162,8 @@ impl M4bApp {
                 Ok(status) => status.code().unwrap_or(-1),
                 Err(_) => -1,
             };
+            // Finish logging before allowing another export to clear the log.
+            let _ = stderr_thread.join();
 
             if let Ok(mut log) = ffmpeg_output_clone.lock() {
                 if exit_code == 0 {
@@ -165,6 +173,7 @@ impl M4bApp {
                 }
             }
 
+            export_running.store(false, Ordering::SeqCst);
             ctx_clone.request_repaint();
         });
 
@@ -199,7 +208,12 @@ impl App for M4bApp {
                     self.files = files.iter().map(|p| p.display().to_string()).collect();
                 }
 
-                if ui.button("💾 Export to .m4b").clicked()
+                if ui
+                    .add_enabled(
+                        !self.export_running.load(Ordering::SeqCst),
+                        egui::Button::new("💾 Export to .m4b"),
+                    )
+                    .clicked()
                     && let Some(output) =
                         FileDialog::new().set_file_name("audiobook.m4b").save_file()
                 {
@@ -239,6 +253,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "M4B Maker",
         options,
-        Box::new(|_cc| Box::new(M4bApp::default())),
+        Box::new(|_cc| Ok(Box::new(M4bApp::default()))),
     )
 }
