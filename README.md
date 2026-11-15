@@ -28,7 +28,8 @@ cargo run
 
 Use “Dark mode” to switch the appearance.
 
-Click “Select files…” and choose your audio files. Files are automatically sorted by filename with numbers in numeric order (1, 2, 10).
+Click “Select files…” and choose “Individual audio files…” or “Audio folder…”.
+Folder selection loads MP3, M4A, and WAV files directly inside the folder; subfolders are not included. Files are automatically sorted by filename with numbers in numeric order (1, 2, 10).
 Expand the selected file list to check export order and use Up/Down to adjust it.
 “Sort by chapter number” restores the automatic order.
 Each input file becomes a chapter marker, following that export order. Chapter names
@@ -53,4 +54,6 @@ click Save
 Use “Cancel conversion” to stop chapter preparation or encoding. Unfinished output
 is discarded; an existing destination is replaced only after a successful export.
 
-Conversion status updates in place. Expand “Conversion details” for recent warnings and errors.
+Conversion status updates in place, including estimated encoding time remaining
+based on audio duration and current conversion speed. The estimate can change as
+speed changes; final file preparation can take additional time. Expand “Conversion details” for recent warnings and errors.

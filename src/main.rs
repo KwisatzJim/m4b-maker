@@ -58,6 +58,24 @@ fn sort_chapters(files: &mut [String]) {
     });
 }
 
+fn folder_audio_files(folder: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(folder)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_file()
+            && path.extension().and_then(|s| s.to_str()).is_some_and(|s| {
+                ["mp3", "m4a", "wav"]
+                    .iter()
+                    .any(|ext| s.eq_ignore_ascii_case(ext))
+            })
+        {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
 fn escape_chapter_title(title: &str) -> String {
     title
         .replace('\\', "\\\\")
@@ -122,7 +140,7 @@ fn cancellable_output(
 fn chapter_metadata(
     files: &[String],
     cancel: &AtomicBool,
-) -> Result<tempfile::NamedTempFile, String> {
+) -> Result<(tempfile::NamedTempFile, u64), String> {
     let mut metadata = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
     writeln!(metadata, ";FFMETADATA1").map_err(|e| e.to_string())?;
     let mut start = 0_u64;
@@ -194,7 +212,33 @@ fn chapter_metadata(
         start = end;
     }
     metadata.flush().map_err(|e| e.to_string())?;
-    Ok(metadata)
+    Ok((metadata, start))
+}
+
+fn remaining_time(total_us: u64, processed_us: Option<u64>, speed: &str) -> String {
+    let Some(processed_us) = processed_us else {
+        return "Estimating…".into();
+    };
+    let Some(speed) = speed
+        .trim()
+        .trim_end_matches('x')
+        .parse::<f64>()
+        .ok()
+        .filter(|s| s.is_finite() && *s > 0.0)
+    else {
+        return "Estimating…".into();
+    };
+    let seconds = (total_us.saturating_sub(processed_us) as f64 / 1_000_000.0 / speed).ceil();
+    if !seconds.is_finite() || seconds >= u64::MAX as f64 {
+        return "Estimating…".into();
+    }
+    let seconds = seconds as u64;
+    format!(
+        "~{:02}:{:02}:{:02}",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
 }
 
 #[derive(Clone)]
@@ -424,6 +468,7 @@ pub struct M4bApp {
     cover_texture: Option<egui::TextureHandle>,
     pending_preview: Option<Receiver<Result<egui::ColorImage, String>>>,
     preview_error: Option<String>,
+    selection_error: Option<String>,
 }
 
 impl Default for M4bApp {
@@ -433,6 +478,7 @@ impl Default for M4bApp {
             cover_texture: None,
             pending_preview: None,
             preview_error: None,
+            selection_error: None,
             folders: FolderMemory::load(),
             files: vec![],
             dark_mode: true,
@@ -448,6 +494,21 @@ impl Default for M4bApp {
 }
 
 impl M4bApp {
+    fn select_audio(&mut self, files: Vec<PathBuf>, input_folder: Option<PathBuf>) {
+        self.selection_error = None;
+        self.folders.input = input_folder;
+        self.save_folders();
+        self.files = files.iter().map(|p| p.display().to_string()).collect();
+        sort_chapters(&mut self.files);
+        self.set_artwork(None);
+        let files = self.files.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.detected_info = Some(receiver);
+        thread::spawn(move || {
+            let _ = sender.send(detect_book_info(&files));
+        });
+    }
+
     fn new_book(&mut self) {
         if self.export_running.load(Ordering::SeqCst) {
             return;
@@ -455,6 +516,7 @@ impl M4bApp {
         self.files.clear();
         self.title.clear();
         self.author.clear();
+        self.selection_error = None;
         // Drop receivers so late detection results cannot refill the cleared fields.
         self.detected_info = None;
         self.set_artwork(None);
@@ -559,7 +621,7 @@ impl M4bApp {
             }
             ctx_clone.request_repaint();
             // Keep the temporary chapter file alive until FFmpeg has finished.
-            let chapters = match chapter_metadata(&files, &cancel) {
+            let (chapters, total_us) = match chapter_metadata(&files, &cancel) {
                 Ok(chapters) => chapters,
                 Err(error) => {
                     if let Ok(mut log) = ffmpeg_output_clone.lock() {
@@ -686,6 +748,10 @@ impl M4bApp {
                 }
             };
 
+            if let Ok(mut status) = progress.lock() {
+                *status = "Converting • Time remaining: Estimating…".into();
+            }
+            ctx_clone.request_repaint();
             let stdout = BufReader::new(child.stdout.take().unwrap());
             let stderr = BufReader::new(child.stderr.take().unwrap());
 
@@ -714,18 +780,29 @@ impl M4bApp {
             let stdout_thread = thread::spawn(move || {
                 let mut elapsed = String::from("00:00:00");
                 let mut speed = String::new();
+                let mut processed_us = None;
                 for line in stdout.lines().map_while(Result::ok) {
                     if let Some((key, value)) = line.split_once('=') {
                         match key {
+                            "out_time_us" => {
+                                processed_us = value.parse::<i64>().ok().map(|us| us.max(0) as u64)
+                            }
                             "out_time" => {
                                 elapsed = value.split('.').next().unwrap_or(value).to_owned()
                             }
                             "speed" => speed = value.trim().to_owned(),
                             "progress" => {
                                 if let Ok(mut status) = progress_for_reader.lock() {
-                                    *status = format!(
-                                        "Converting • Audio processed: {elapsed} • Speed: {speed}"
-                                    );
+                                    *status = if value == "end"
+                                        || processed_us.is_some_and(|us| us >= total_us)
+                                    {
+                                        "Finalizing audiobook…".into()
+                                    } else {
+                                        format!(
+                                            "Converting • Audio processed: {elapsed} • Speed: {speed} • Time remaining: {}",
+                                            remaining_time(total_us, processed_us, &speed)
+                                        )
+                                    };
                                 }
                                 repaint.request_repaint();
                             }
@@ -862,31 +939,30 @@ impl App for M4bApp {
                     ui.add_enabled_ui(!running, |ui| {
                 ui.heading("Audio files");
                 ui.horizontal(|ui| {
-                    if ui.button("Select files…").clicked() {
-                        let mut dialog =
-                            FileDialog::new().add_filter("Audio", &["mp3", "m4a", "wav"]);
-                        if let Some(folder) = &self.folders.input {
-                            dialog = dialog.set_directory(folder);
-                        }
-                        if let Some(files) = dialog.pick_files() {
-                            self.folders.input = files
-                                .first()
-                                .and_then(|p| p.parent())
-                                .map(Path::to_path_buf);
-                            self.save_folders();
-                            self.files = files.iter().map(|p| p.display().to_string()).collect();
-                            sort_chapters(&mut self.files);
-                            self.set_artwork(None);
-                            let files = self.files.clone();
-                            let (sender, receiver) = mpsc::channel();
-                            self.detected_info = Some(receiver);
-                            thread::spawn(move || {
-                                let _ = sender.send(detect_book_info(&files));
-                            });
+                    let mut choose_folder = None;
+                    ui.menu_button("Select files…", |ui| {
+                        if ui.button("Individual audio files…").clicked() { choose_folder = Some(false); ui.close(); }
+                        if ui.button("Audio folder…").clicked() { choose_folder = Some(true); ui.close(); }
+                    });
+                    if let Some(folder_mode) = choose_folder {
+                        let mut dialog = FileDialog::new().add_filter("Audio", &["mp3", "m4a", "wav"]);
+                        if let Some(folder) = &self.folders.input { dialog = dialog.set_directory(folder); }
+                        if folder_mode {
+                            if let Some(folder) = dialog.pick_folder() {
+                                match folder_audio_files(&folder) {
+                                    Ok(files) if !files.is_empty() => self.select_audio(files, Some(folder)),
+                                    Ok(_) => self.selection_error = Some("This folder contains no MP3, M4A, or WAV files. Subfolders are not included.".into()),
+                                    Err(error) => self.selection_error = Some(format!("Could not read the folder: {error}")),
+                                }
+                            }
+                        } else if let Some(files) = dialog.pick_files() {
+                            let folder = files.first().and_then(|p| p.parent()).map(Path::to_path_buf);
+                            self.select_audio(files, folder);
                         }
                     }
                     ui.label(format!("{} files selected", self.files.len()));
                 });
+                if let Some(error) = &self.selection_error { ui.colored_label(ui.visuals().error_fg_color, error); }
                 ui.small("Files are sorted by name with chapter numbers in numeric order. Expand below to adjust.");
                 ui.collapsing("Selected files (export order)", |ui| {
                     egui::ScrollArea::vertical()
@@ -1061,6 +1137,68 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eta_uses_remaining_audio_and_conversion_speed() {
+        assert_eq!(
+            remaining_time(7_200_000_000, Some(3_600_000_000), "2.0x"),
+            "~00:30:00"
+        );
+        assert_eq!(
+            remaining_time(7_200_000_000, Some(3_600_000_000), "0.5x"),
+            "~02:00:00"
+        );
+        assert_eq!(
+            remaining_time(1_000_000, Some(2_000_000), "1x"),
+            "~00:00:00"
+        );
+        assert_eq!(remaining_time(1_000_000, Some(0), "3x"), "~00:00:01");
+        for speed in ["N/A", "0x", "-1x", "NaNx", "infx"] {
+            assert_eq!(remaining_time(1_000_000, Some(0), speed), "Estimating…");
+        }
+        assert_eq!(remaining_time(1_000_000, None, "2x"), "Estimating…");
+    }
+
+    #[test]
+    fn folder_selection_includes_only_supported_files_directly_inside() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "Chapter 10.mp3",
+            "Chapter 2.MP3",
+            "Chapter 1.m4a",
+            "bonus.wav",
+            "cover.jpg",
+            "notes.txt",
+        ] {
+            std::fs::write(dir.path().join(name), []).unwrap();
+        }
+        let nested = dir.path().join("subfolder.mp3");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("nested.mp3"), []).unwrap();
+        let mut files = folder_audio_files(dir.path())
+            .unwrap()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>();
+        sort_chapters(&mut files);
+        let names: Vec<_> = files
+            .iter()
+            .map(|p| Path::new(p).file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "bonus.wav",
+                "Chapter 1.m4a",
+                "Chapter 2.MP3",
+                "Chapter 10.mp3"
+            ]
+        );
+        assert!(folder_audio_files(&dir.path().join("missing")).is_err());
+        assert!(folder_audio_files(&nested).unwrap().len() == 1);
+        let empty = tempfile::tempdir().unwrap();
+        assert!(folder_audio_files(empty.path()).unwrap().is_empty());
+    }
 
     #[test]
     fn new_book_clears_book_state_and_discards_late_results() {
