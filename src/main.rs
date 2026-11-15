@@ -58,18 +58,41 @@ fn sort_chapters(files: &mut [String]) {
     });
 }
 
+fn is_audio_file(path: &Path) -> bool {
+    path.extension().and_then(|s| s.to_str()).is_some_and(|s| {
+        ["mp3", "m4a", "wav"]
+            .iter()
+            .any(|ext| s.eq_ignore_ascii_case(ext))
+    })
+}
+
+fn dropped_audio_files(paths: &[PathBuf]) -> std::io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for path in paths {
+        let metadata = std::fs::metadata(path)?;
+        let candidates = if metadata.is_dir() {
+            folder_audio_files(path)?
+        } else if metadata.is_file() && is_audio_file(path) {
+            vec![path.clone()]
+        } else {
+            Vec::new()
+        };
+        for file in candidates {
+            if seen.insert(file.canonicalize()?) {
+                files.push(file);
+            }
+        }
+    }
+    Ok(files)
+}
+
 fn folder_audio_files(folder: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(folder)? {
         let entry = entry?;
         let path = entry.path();
-        if entry.file_type()?.is_file()
-            && path.extension().and_then(|s| s.to_str()).is_some_and(|s| {
-                ["mp3", "m4a", "wav"]
-                    .iter()
-                    .any(|ext| s.eq_ignore_ascii_case(ext))
-            })
-        {
+        if entry.file_type()?.is_file() && is_audio_file(&path) {
             files.push(path);
         }
     }
@@ -276,8 +299,9 @@ fn filename_info(path: &str) -> BookInfo {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("");
-    // A separator alone cannot tell us the order: use the common Author - Title convention.
-    for separator in [" - ", " – ", " — "] {
+    // Interpret supported filename pairs as Author - Title or Author,Title.
+    // Prefer spaced dashes so commas inside a title do not override that convention.
+    for separator in [" - ", " – ", " — ", ","] {
         if let Some((author, title)) = stem.split_once(separator)
             && !author.trim().is_empty()
             && !title.trim().is_empty()
@@ -494,6 +518,21 @@ impl Default for M4bApp {
 }
 
 impl M4bApp {
+    fn accept_drop(&mut self, paths: &[PathBuf]) {
+        if self.export_running.load(Ordering::SeqCst) {
+            self.selection_error = Some("Wait for the current conversion to finish or cancel it before dropping another book.".into());
+            return;
+        }
+        match dropped_audio_files(paths) {
+            Ok(files) if !files.is_empty() => {
+                let folder = paths.first().and_then(|p| if p.is_dir() { Some(p.clone()) } else { p.parent().map(Path::to_path_buf) });
+                self.select_audio(files, folder);
+            }
+            Ok(_) => self.selection_error = Some("Drop MP3, M4A, or WAV files, or a folder containing them. Subfolders are not included.".into()),
+            Err(error) => self.selection_error = Some(format!("Could not read dropped files: {error}")),
+        }
+    }
+
     fn select_audio(&mut self, files: Vec<PathBuf>, input_folder: Option<PathBuf>) {
         self.selection_error = None;
         self.folders.input = input_folder;
@@ -862,6 +901,19 @@ impl M4bApp {
 
 impl App for M4bApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
+        let dropped = ctx.input(|input| input.raw.dropped_files.clone());
+        if !dropped.is_empty() {
+            let paths: Vec<_> = dropped
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .collect();
+            if paths.is_empty() {
+                self.selection_error =
+                    Some("Drop local audio files or folders from your file manager.".into());
+            } else {
+                self.accept_drop(&paths);
+            }
+        }
         if let Some(receiver) = &self.detected_info {
             match receiver.try_recv() {
                 Ok(info) => {
@@ -938,6 +990,11 @@ impl App for M4bApp {
                     ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
                     ui.add_enabled_ui(!running, |ui| {
                 ui.heading("Audio files");
+                if ctx.input(|input| !input.raw.hovered_files.is_empty()) {
+                    ui.colored_label(ui.visuals().selection.stroke.color, "Release to load audio files or folders");
+                } else {
+                    ui.small("Drag audio files or a folder into this window, or select them below. A new selection replaces the file list.");
+                }
                 ui.horizontal(|ui| {
                     let mut choose_folder = None;
                     ui.menu_button("Select files…", |ui| {
@@ -1018,7 +1075,7 @@ impl App for M4bApp {
                         ui.label("Checking book information and artwork…");
                     });
                 }
-                ui.small("Empty fields are filled from audio tags, then Author - Title filenames.");
+                ui.small("Empty fields use audio tags, then Author - Title or Author,Title filenames.");
                 ui.separator();
                 ui.heading("Cover artwork");
                 if let Some(texture) = &self.cover_texture {
@@ -1123,6 +1180,7 @@ impl App for M4bApp {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_drag_and_drop(true)
             .with_inner_size([720.0, 700.0])
             .with_min_inner_size([560.0, 620.0]),
         ..Default::default()
@@ -1137,6 +1195,60 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropped_files_and_folders_filter_and_deduplicate_audio() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("Chapter 2.MP3");
+        let cover = dir.path().join("cover.jpg");
+        std::fs::write(&audio, []).unwrap();
+        std::fs::write(&cover, []).unwrap();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("nested.mp3"), []).unwrap();
+        let files = dropped_audio_files(&[
+            audio.clone(),
+            dir.path().to_path_buf(),
+            cover.clone(),
+            audio.clone(),
+        ])
+        .unwrap();
+        assert_eq!(files, vec![audio]);
+        assert!(dropped_audio_files(&[cover]).unwrap().is_empty());
+        assert!(dropped_audio_files(&[dir.path().join("missing.mp3")]).is_err());
+    }
+
+    #[test]
+    fn dropping_during_export_preserves_current_book() {
+        let mut app = M4bApp {
+            files: vec!["original.mp3".into()],
+            title: "Current book".into(),
+            ..Default::default()
+        };
+        app.export_running.store(true, Ordering::SeqCst);
+        app.accept_drop(&[PathBuf::from("another.mp3")]);
+        assert_eq!(app.files, ["original.mp3"]);
+        assert_eq!(app.title, "Current book");
+        assert!(app.selection_error.is_some());
+    }
+
+    #[test]
+    fn comma_separated_filenames_supply_author_and_title() {
+        for filename in [
+            "Jane Austen,Pride and Prejudice.mp3",
+            "Jane Austen, Pride and Prejudice.mp3",
+        ] {
+            let info = filename_info(filename);
+            assert_eq!(info.author, "Jane Austen");
+            assert_eq!(info.title, "Pride and Prejudice");
+        }
+        let info = filename_info("Jane Austen - Book title, with a comma.mp3");
+        assert_eq!(info.author, "Jane Austen");
+        assert_eq!(info.title, "Book title, with a comma");
+        assert!(filename_info("01,Chapter One.mp3").author.is_empty());
+        assert!(filename_info(",Missing Author.mp3").author.is_empty());
+        assert!(filename_info("Missing Title,.mp3").title.is_empty());
+    }
 
     #[test]
     fn eta_uses_remaining_audio_and_conversion_speed() {

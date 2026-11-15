@@ -29,7 +29,10 @@ cargo run
 Use “Dark mode” to switch the appearance.
 
 Click “Select files…” and choose “Individual audio files…” or “Audio folder…”.
-Folder selection loads MP3, M4A, and WAV files directly inside the folder; subfolders are not included. Files are automatically sorted by filename with numbers in numeric order (1, 2, 10).
+You can also drag audio files or folders into the app window. A new selection
+replaces the current file list; unsupported files are ignored when dropping mixed items.
+Folder selection loads MP3, M4A, and WAV files directly inside the folder; subfolders are not included.
+Drops are blocked during conversion. Files are automatically sorted by filename with numbers in numeric order (1, 2, 10).
 Expand the selected file list to check export order and use Up/Down to adjust it.
 “Sort by chapter number” restores the automatic order.
 Each input file becomes a chapter marker, following that export order. Chapter names
@@ -38,7 +41,7 @@ The app uses FFprobe to read durations before exporting; unreadable durations st
 the export with an explanation in Conversion details.
 
 Title and Author are filled automatically when empty: the app checks audio tags
-(using `ffprobe`, included with FFmpeg), then filenames in `Author - Title` format.
+(using `ffprobe`, included with FFmpeg), then filenames in `Author - Title` or `Author,Title` format.
 Album is preferred for the book title because track titles often name chapters.
 Review or edit the detected values before exporting. Click “New book” before
 selecting another book to clear the previous files, metadata, artwork, and status.
